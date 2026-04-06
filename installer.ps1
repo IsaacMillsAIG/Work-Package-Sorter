@@ -7,8 +7,8 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 # ── CONFIGURATION — update these before sharing ─────────────
-$GITHUB_USER   = "YOUR_GITHUB_USERNAME"        # e.g. "isaacm"
-$GITHUB_REPO   = "work-package-sorter"         # your repo name
+$GITHUB_USER   = "IsaacMillsAIG"        # e.g. "isaacm"
+$GITHUB_REPO   = "Work-Package-Sorter"         # your repo name
 $GITHUB_BRANCH = "main"
 $INSTALL_DIR   = "$env:LOCALAPPDATA\WorkPackageSorter"
 $APP_NAME      = "Work Package Sorter"
