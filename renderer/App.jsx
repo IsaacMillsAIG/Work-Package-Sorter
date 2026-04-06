@@ -690,6 +690,7 @@ function App() {
   const handleRun = async () => {
     if (!pdfPath) { setError("Please select a PDF file first."); return; }
     setError("");
+    cancelRef.current = false;  // always reset before a new run
     progressLinesRef.current = [];
     setProgressLines([]);
     setShowProgress(true);
