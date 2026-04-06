@@ -162,14 +162,37 @@ if (-not (Test-Path $exePath)) {
 }
 Write-Host "  App built." -ForegroundColor Green
  
-# Desktop shortcut
-$shortcutPath = "$env:USERPROFILE\Desktop\$APP_NAME.lnk"
+# Desktop shortcut - find the real logged-in user, not the admin running this script
+# Get the user who owns the explorer.exe process (the actual desktop session)
+$realUser = (Get-WmiObject Win32_Process -Filter "Name='explorer.exe'" |
+    ForEach-Object { $_.GetOwner() } |
+    Where-Object { $_.User -ne $null } |
+    Select-Object -First 1).User
+ 
+if ($realUser) {
+    $realDesktop = "C:\Users\$realUser\Desktop"
+} else {
+    # Fallback: use the interactive session username
+    $realUser = (query user 2>$null | Select-String "Active" | ForEach-Object {
+        ($_ -split "\s+")[1]
+    } | Select-Object -First 1)
+    $realDesktop = "C:\Users\$realUser\Desktop"
+}
+ 
+Write-Host "  Creating shortcut for user: $realUser"
+ 
 $shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = $exePath
-$shortcut.WorkingDirectory = Split-Path $exePath
-$shortcut.Description = "Steel Fabrication Drawing Work Package Sorter"
-$shortcut.Save()
+if (Test-Path $realDesktop) {
+    $sc = $shell.CreateShortcut("$realDesktop\$APP_NAME.lnk")
+    $sc.TargetPath = $exePath
+    $sc.WorkingDirectory = Split-Path $exePath
+    $sc.Description = "Steel Fabrication Drawing Work Package Sorter"
+    $sc.Save()
+    Write-Host "  Shortcut created on ${realUser}'s Desktop." -ForegroundColor Green
+} else {
+    Write-Host "  Desktop not found at $realDesktop" -ForegroundColor Yellow
+    Write-Host "  App is at: $exePath" -ForegroundColor Yellow
+}
  
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Green
