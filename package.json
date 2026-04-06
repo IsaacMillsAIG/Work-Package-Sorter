@@ -1,0 +1,41 @@
+{
+  "name": "work-package-sorter",
+  "version": "1.0.0",
+  "description": "Steel Fabrication Drawing Work Package Sorter",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win --x64",
+    "dev": "electron . --dev"
+  },
+  "build": {
+    "appId": "com.yourcompany.workpackagesorter",
+    "productName": "Work Package Sorter",
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "assets/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "sorter.exe",
+        "to": "sorter.exe"
+      }
+    ]
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.0.0"
+  }
+}

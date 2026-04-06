@@ -1,0 +1,10 @@
+node_modules/
+dist/
+build_tmp/
+sorter.exe
+*.spec
+__pycache__/
+*.pyc
+.DS_Store
+assets/icon.ico
+wps_debug_text.txt
