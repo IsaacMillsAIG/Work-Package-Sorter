@@ -47,11 +47,15 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-// ── IPC: Open file picker for PDF ───────────────────────────────────────────
+// ── IPC: Open file picker for PDF or PFXT ────────────────────────────────────
 ipcMain.handle("pick-pdf", async () => {
   const result = await dialog.showOpenDialog({
-    title: "Select Drawing Package PDF",
-    filters: [{ name: "PDF Files", extensions: ["pdf"] }],
+    title: "Select Drawing Package (PDF or PFXT)",
+    filters: [
+      { name: "Drawing Files", extensions: ["pdf", "pfxt", "pfxs", "pfxa"] },
+      { name: "PDF Files", extensions: ["pdf"] },
+      { name: "PowerFab Exchange Files", extensions: ["pfxt", "pfxs", "pfxa"] },
+    ],
     properties: ["openFile"],
   });
   if (result.canceled || result.filePaths.length === 0) return null;
@@ -132,6 +136,8 @@ ipcMain.handle("load-rules", async () => {
 
 // ── IPC: Run the Python sorter ───────────────────────────────────────────────
 ipcMain.handle("run-sorter", async (event, { pdfPath, configPath, outputDir }) => {
+  // pdfPath may now be a .pdf OR .pfxt file — name kept for backwards compat
+  const inputPath = pdfPath;
   return new Promise((resolve) => {
     // ── Pre-flight checks ──────────────────────────────────────────────────
     const scriptPath = getScriptPath();
@@ -142,8 +148,8 @@ ipcMain.handle("run-sorter", async (event, { pdfPath, configPath, outputDir }) =
       });
     }
 
-    if (!fs.existsSync(pdfPath)) {
-      return resolve({ success: false, error: "The selected PDF file no longer exists." });
+    if (!fs.existsSync(inputPath)) {
+      return resolve({ success: false, error: "The selected file no longer exists." });
     }
 
     // Ensure output dir exists
@@ -162,9 +168,15 @@ ipcMain.handle("run-sorter", async (event, { pdfPath, configPath, outputDir }) =
       return resolve({ success: false, error: `Output folder is not writable: ${outputDir}` });
     }
 
-    // ── Build args ────────────────────────────────────────────────────────
+    // ── Detect file type and build args ───────────────────────────────────
+    const ext = path.extname(inputPath).toLowerCase();
+    const isPfxt = [".pfxt", ".pfxs", ".pfxa"].includes(ext);
     const tmpJson = path.join(os.tmpdir(), `wps_${Date.now()}.json`);
-    const args = [pdfPath, "--output-dir", outputDir, "--json-file", tmpJson];
+
+    const args = [inputPath, "--output-dir", outputDir, "--json-file", tmpJson];
+    if (isPfxt) {
+      args.push("--source", "pfxt");
+    }
     if (configPath && fs.existsSync(configPath)) {
       args.push("--config", configPath);
     }

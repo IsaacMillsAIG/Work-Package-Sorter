@@ -2,11 +2,22 @@
 """
 Steel Fabrication Drawing Package — Work Package Sorter
 ========================================================
-Parses Tekla/SDS2-style shop drawing PDFs, extracts BOM data from each page,
-classifies drawings into configurable work packages, and splits the PDF.
+Parses steel fabrication drawing data from multiple sources:
+  - PDF drawing packages (Tekla/SDS2-style title block parsing)
+  - PFXT files (Tekla PowerFab eXchange — compressed XML with full BOM)
+
+Classifies assemblies into configurable work packages and splits the PDF.
 
 Usage:
+    # PDF (original mode — unchanged):
     python work_package_sorter.py input.pdf [--config rules.yaml] [--output-dir ./output]
+
+    # PFXT (new):
+    python work_package_sorter.py export.pfxt [--config rules.yaml] [--output-dir ./output]
+
+    # Force source type explicitly:
+    python work_package_sorter.py input.pdf --source pdf
+    python work_package_sorter.py export.pfxt --source pfxt
 """
 
 import pdfplumber
@@ -16,6 +27,8 @@ import yaml
 import os
 import sys
 import csv
+import zipfile
+import xml.etree.ElementTree as ET
 from pypdf import PdfReader, PdfWriter
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -271,6 +284,280 @@ def parse_pdf(pdf_path: str) -> list[DrawingData]:
             if d:
                 drawings.append(d)
     return drawings
+
+
+# ─────────────────────────────────────────────────────────────
+# PFXT PARSER (Tekla PowerFab eXchange files)
+# ─────────────────────────────────────────────────────────────
+
+PFXT_NS = {"fs": "http://www.fabsuite.com/XML_Schemas/FabSuiteDataFile0104.xsd"}
+
+
+def _pfxt_find_text(element, tag: str, default: str = "") -> str:
+    """Find text content in a PFXT XML element, handling namespace."""
+    if element is None:
+        return default
+    child = element.find(f"fs:{tag}", PFXT_NS)
+    if child is None:
+        child = element.find(tag)
+    if child is not None and child.text:
+        return child.text.strip()
+    return default
+
+
+def _pfxt_parse_section(shape: str, dimensions: str) -> str:
+    """Reconstruct a section string from PFXT Shape + Dimensions fields.
+
+    PFXT stores these separately:
+        Shape="W"  Dimensions="24 x 76"    → "W24x76"
+        Shape="L"  Dimensions="4 x 4 x 3/8" → "L4x4x3/8"
+        Shape="HSS" Dimensions="4 x 4 x 5/16" → "HSS4x4x5/16"
+    """
+    if not shape or not dimensions:
+        return ""
+    dim_clean = re.sub(r'\s*x\s*', 'x', dimensions.strip())
+    dim_clean = dim_clean.replace('§', '').strip()
+    return f"{shape}{dim_clean}"
+
+
+def _pfxt_infer_member_type(mark: str, main_shape: str, main_category: str) -> str:
+    """Infer the member type (BEAM, COLUMN, etc.) from PFXT data."""
+    prefix = re.match(r'^([A-Z]+)', mark)
+    prefix = prefix.group(1) if prefix else ""
+    cat_upper = main_category.upper()
+
+    if "COLUMN" in cat_upper:
+        return "COLUMN"
+    elif "BEAM" in cat_upper or "JOIST" in cat_upper:
+        return "BEAM"
+    elif "BRACE" in cat_upper:
+        return "VERTICAL BRACE"
+    elif "ANGLE" in cat_upper and prefix == "A":
+        return "ANGLE"
+    elif "BENT" in cat_upper:
+        return "BENT PLATE"
+
+    prefix_map = {
+        "B": "BEAM", "C": "COLUMN", "A": "ANGLE",
+        "BP": "BENT PLATE", "BR": "VERTICAL BRACE",
+        "VB": "VERTICAL BRACE", "M": "POST", "PL": "PLATE",
+    }
+    return prefix_map.get(prefix, "BEAM")
+
+
+def parse_pfxt_assembly(asm_element, index: int, drawing_statuses: dict) -> DrawingData:
+    """Convert a single PFXT <Assembly> element into a DrawingData record."""
+    d = DrawingData(page_number=index + 1)
+
+    d.sheet_no = _pfxt_find_text(asm_element, "AssemblyMark")
+    d.ship_mark = d.sheet_no
+
+    prefix_m = re.match(r'^([A-Z]+)', d.sheet_no)
+    d.mark_prefix = prefix_m.group(1) if prefix_m else ""
+
+    drawing_no = _pfxt_find_text(asm_element, "DrawingNumber")
+
+    all_parts = asm_element.findall("fs:AssemblyPart", PFXT_NS)
+    if not all_parts:
+        all_parts = asm_element.findall("AssemblyPart")
+
+    main_parts = [p for p in all_parts if _pfxt_find_text(p, "MainMember") == "1"]
+    minor_parts = [p for p in all_parts if _pfxt_find_text(p, "MainMember") != "1"]
+
+    if main_parts:
+        main = main_parts[0]
+        shape = _pfxt_find_text(main, "Shape")
+        dims = _pfxt_find_text(main, "Dimensions")
+        d.main_section = _pfxt_parse_section(shape, dims)
+        d.grade = _pfxt_find_text(main, "Grade")
+        main_category = _pfxt_find_text(main, "Category")
+
+        w_m = re.match(r'W(\d+)x(\d+)', d.main_section)
+        if w_m:
+            d.section_depth = float(w_m.group(1))
+            d.section_weight_per_ft = float(w_m.group(2))
+        else:
+            hss_m = re.match(r'(?:HSS|TS)(\d+)', d.main_section)
+            if hss_m:
+                d.section_depth = float(hss_m.group(1))
+
+        for part in main_parts:
+            finish = _pfxt_find_text(part, "Finish").upper()
+            if "GALV" in finish:
+                d.galvanize = True
+    else:
+        main_category = ""
+
+    d.details_of = _pfxt_infer_member_type(
+        d.sheet_no,
+        _pfxt_find_text(main_parts[0], "Shape") if main_parts else "",
+        main_category
+    )
+
+    d.num_minor_marks = len(minor_parts)
+    part_types = set()
+    for part in minor_parts:
+        shape = _pfxt_find_text(part, "Shape").upper()
+        category = _pfxt_find_text(part, "Category").upper()
+        remark = _pfxt_find_text(part, "Remark").upper()
+
+        if "BENT" in category or remark == "BENT":
+            part_types.add("BPL")
+        elif shape == "FB" or "FLAT" in category:
+            part_types.add("FB")
+        elif shape == "PL" or "PLATE" in category or "LAYOUT" in category:
+            part_types.add("PL")
+        elif shape.startswith("L") or "ANGLE" in category:
+            part_types.add("L")
+        elif shape.startswith("C") or "CHANNEL" in category:
+            part_types.add("C")
+        elif "HSS" in shape or "TS" in shape or "TUBE" in category:
+            part_types.add("HSS")
+        elif "WT" in shape:
+            part_types.add("WT")
+        else:
+            part_types.add("PL")
+
+    d.minor_mark_types = sorted(part_types)
+    d.has_plates = "PL" in part_types
+    d.has_bent_plates = "BPL" in part_types
+    d.has_angles_attached = "L" in part_types
+    d.has_channels = "C" in part_types
+    d.has_flat_bars = "FB" in part_types
+    d.has_tubes_hss = "HSS" in part_types
+
+    all_text = " ".join(
+        _pfxt_find_text(p, "Remark") + " " + _pfxt_find_text(p, "Category")
+        for p in all_parts
+    )
+    d.has_cjp_dcw = bool(re.search(r'CJP|DCW|DEMAND\s*CRITICAL', all_text, re.IGNORECASE))
+    d.has_pjp = bool(re.search(r'PJP|PARTIAL\s*JOINT', all_text, re.IGNORECASE))
+
+    status = drawing_statuses.get(drawing_no, "")
+    if "HOLD" in status.upper():
+        d.fab_status = "HOLD"
+    elif status:
+        d.fab_status = "FOR FABRICATION"
+    else:
+        d.fab_status = "FOR FABRICATION"
+
+    return d
+
+
+def parse_pfxt(pfxt_path: str) -> tuple[list[DrawingData], dict]:
+    """
+    Parse a .pfxt file (Tekla PowerFab eXchange format).
+
+    PFXT is a ZIP archive containing an XML file with full BOM/assembly data.
+    Returns: (list of DrawingData, project metadata dict)
+    """
+    if not zipfile.is_zipfile(pfxt_path):
+        raise ValueError(f"{pfxt_path} is not a valid .pfxt file (not a ZIP archive)")
+
+    xml_content = None
+    with zipfile.ZipFile(pfxt_path, 'r') as zf:
+        for name in zf.namelist():
+            if name.endswith('.xml') and '/' not in name:
+                xml_content = zf.read(name)
+                break
+
+    if xml_content is None:
+        raise ValueError(f"No XML file found in {pfxt_path}")
+
+    root = ET.fromstring(xml_content)
+
+    project_info = {}
+    proj = root.find(".//fs:ProjectData/fs:ContractData/fs:ProjectId", PFXT_NS)
+    if proj is not None:
+        project_info["project_number"] = _pfxt_find_text(proj, "ProjectNumber")
+        project_info["project_name"] = _pfxt_find_text(proj, "ProjectName")
+
+    source = root.find(".//fs:FileSourceData", PFXT_NS)
+    if source is not None:
+        project_info["source_app"] = _pfxt_find_text(source, "SourceApplication")
+        project_info["source_version"] = _pfxt_find_text(source, "SourceApplicationVersion")
+        project_info["export_date"] = _pfxt_find_text(source, "FileCreationDate")
+        company = source.find("fs:CompanyData", PFXT_NS)
+        if company is not None:
+            project_info["company"] = _pfxt_find_text(company, "CompanyName")
+
+    drawing_statuses = {}
+    for md in root.findall(".//fs:MultiDrawing", PFXT_NS):
+        dnum = _pfxt_find_text(md, "DrawingNumber")
+        rev_desc = _pfxt_find_text(md, "DrawingRevision/RevisionDescription")
+        if dnum and rev_desc:
+            drawing_statuses[dnum] = rev_desc
+    for sd in root.findall(".//fs:SingleDrawing", PFXT_NS):
+        dnum = _pfxt_find_text(sd, "DrawingNumber")
+        rev_desc = _pfxt_find_text(sd, "DrawingRevision/RevisionDescription")
+        if dnum and rev_desc:
+            drawing_statuses[dnum] = rev_desc
+
+    assemblies = root.findall(".//fs:Assembly", PFXT_NS)
+    if not assemblies:
+        assemblies = root.findall(".//Assembly")
+
+    drawings = []
+    seen_marks = set()
+    for i, asm in enumerate(assemblies):
+        mark = _pfxt_find_text(asm, "AssemblyMark")
+        if mark in seen_marks:
+            continue
+        seen_marks.add(mark)
+        d = parse_pfxt_assembly(asm, len(drawings), drawing_statuses)
+        drawings.append(d)
+
+    project_info["total_assemblies"] = len(drawings)
+    project_info["file_type"] = "pfxt"
+
+    return drawings, project_info
+
+
+# ─────────────────────────────────────────────────────────────
+# UNIFIED FILE DETECTION
+# ─────────────────────────────────────────────────────────────
+
+def detect_file_type(filepath: str) -> str:
+    """Auto-detect whether a file is a PDF or PFXT."""
+    ext = Path(filepath).suffix.lower()
+    if ext in ('.pfxt', '.pfxs', '.pfxa'):
+        return 'pfxt'
+    elif ext == '.pdf':
+        return 'pdf'
+    elif ext == '.zip' and zipfile.is_zipfile(filepath):
+        with zipfile.ZipFile(filepath, 'r') as zf:
+            for name in zf.namelist():
+                if name.endswith('.xml') and '/' not in name:
+                    with zf.open(name) as f:
+                        header = f.read(500).decode('utf-8', errors='ignore')
+                        if 'FabSuiteDataExchange' in header:
+                            return 'pfxt'
+    return 'unknown'
+
+
+def parse_file(filepath: str, source_type: str = None) -> tuple[list[DrawingData], dict]:
+    """
+    Parse any supported file type and return DrawingData list + metadata.
+    Auto-detects file type if source_type is not specified.
+    """
+    if source_type is None:
+        source_type = detect_file_type(filepath)
+
+    if source_type == 'pfxt':
+        return parse_pfxt(filepath)
+    elif source_type == 'pdf':
+        drawings = parse_pdf(filepath)
+        meta = {
+            "file_type": "pdf",
+            "total_assemblies": len(drawings),
+            "source_file": os.path.basename(filepath),
+        }
+        return drawings, meta
+    else:
+        raise ValueError(
+            f"Unsupported file type: {Path(filepath).suffix}\n"
+            f"Supported formats: .pdf, .pfxt, .pfxs, .pfxa"
+        )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -605,12 +892,16 @@ def main():
     import argparse
 
     # Force UTF-8 output so Windows doesn't choke on special characters (▾, █, etc.)
-    # Force UTF-8 on stderr for progress lines (compatible with Python 3.7+)
     import io
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 
-    parser = argparse.ArgumentParser(description="Steel Drawing Package Work Package Sorter")
-    parser.add_argument("pdf", help="Path to the drawing package PDF")
+    parser = argparse.ArgumentParser(
+        description="Steel Drawing Package Work Package Sorter",
+        epilog="Supports .pdf drawing packages and .pfxt Tekla PowerFab exchange files."
+    )
+    parser.add_argument("input_file", help="Path to .pdf or .pfxt file")
+    parser.add_argument("--source", choices=["pdf", "pfxt"],
+                        help="Force source type (auto-detected if omitted)")
     parser.add_argument("--config", help="Path to YAML config file with work package rules")
     parser.add_argument("--output-dir", default="./output", help="Output directory for split PDFs")
     parser.add_argument("--json-file", help="Write JSON summary to this file path (required for app mode)")
@@ -623,34 +914,47 @@ def main():
         with open(args.config, encoding="utf-8") as f:
             config = yaml.safe_load(f)
 
-    # Parse
-    print("Parsing {}...".format(args.pdf), file=sys.stderr, flush=True)
-    drawings = parse_pdf(args.pdf)
-    print("  Found {} shop drawings".format(len(drawings)), file=sys.stderr, flush=True)
+    # Detect and parse
+    filepath = args.input_file
+    file_type = args.source or detect_file_type(filepath)
+
+    print(f"Parsing {filepath} (type: {file_type})...", file=sys.stderr, flush=True)
+    drawings, meta = parse_file(filepath, file_type)
+
+    if meta.get('project_name'):
+        print(f"  Project: {meta.get('project_number', '')} — {meta['project_name']}", file=sys.stderr, flush=True)
+    if meta.get('company'):
+        print(f"  Company: {meta['company']}", file=sys.stderr, flush=True)
+    print(f"  Found {len(drawings)} assemblies", file=sys.stderr, flush=True)
 
     # Classify
     print("Classifying drawings...", file=sys.stderr, flush=True)
     drawings = classify_drawings(drawings, config)
 
-    # Split PDFs
-    print("Splitting PDF into work packages...", file=sys.stderr, flush=True)
-    results = split_pdf_by_work_packages(args.pdf, drawings, args.output_dir, config)
-    for wp_name, info in results.items():
-        print("  {}: {} pages".format(wp_name, info["count"]), file=sys.stderr, flush=True)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Split PDFs — only available for PDF input
+    if file_type == 'pdf':
+        print("Splitting PDF into work packages...", file=sys.stderr, flush=True)
+        results = split_pdf_by_work_packages(filepath, drawings, args.output_dir, config)
+        for wp_name, info in results.items():
+            print("  {}: {} pages".format(wp_name, info["count"]), file=sys.stderr, flush=True)
+    else:
+        print("(PDF splitting not available for .pfxt input — CSV/JSON output only)", file=sys.stderr, flush=True)
 
     # Generate CSV
     csv_path = os.path.join(args.output_dir, "drawing_summary.csv")
     generate_summary_csv(drawings, csv_path)
     print("Summary CSV: {}".format(csv_path), file=sys.stderr, flush=True)
 
-    # Write JSON to file (avoids any stdout mixing issues)
+    # Write JSON — to file if --json-file given (app mode), otherwise stdout
     summary = generate_summary_json(drawings, config)
+    summary["project_info"] = meta
     if args.json_file:
         with open(args.json_file, "w", encoding="utf-8") as jf:
             json.dump(summary, jf, indent=2)
         print("Done!", file=sys.stderr, flush=True)
     else:
-        # Fallback: print text summary to stderr and JSON to stdout
         print("Done!", file=sys.stderr, flush=True)
         print(json.dumps(summary, indent=2))
 
