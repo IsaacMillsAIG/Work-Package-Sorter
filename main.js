@@ -217,9 +217,11 @@ ipcMain.handle("run-sorter", async (event, { pdfPath, configPath, outputDir }) =
         try { fs.unlinkSync(jsonTmpFile); } catch(_) {}
         return resolve({ success: false, error: "cancelled" });
       }
-      // Filter out progress lines from stderr — only real errors start with "Traceback" or "Error"
+      // Filter stderr for real errors — broader pattern than before
       const errorLines = stderr.split("\n").filter(l =>
-        l.includes("Traceback") || l.includes("Error:") || l.includes("Exception:")
+        l.includes("Traceback") || l.includes("Error:") || l.includes("Exception:") ||
+        l.includes("error:") || l.includes("ValueError") || l.includes("KeyError") ||
+        l.includes("AttributeError") || l.includes("FileNotFoundError")
       ).join("\n");
 
       if (code !== 0) {
@@ -251,6 +253,14 @@ ipcMain.handle("run-sorter", async (event, { pdfPath, configPath, outputDir }) =
         const data = JSON.parse(jsonStr);
         // Clean up temp file
         try { fs.unlinkSync(tmpJson); } catch(_) {}
+        // If 0 drawings were parsed, treat as a failure with a helpful message
+        if (!data.drawings || data.drawings.length === 0) {
+          const lastLines = stderr.trim().split("\n").slice(-10).join("\n");
+          return resolve({
+            success: false,
+            error: `The file was read but no assemblies were found (0 drawings parsed).\n\nThis usually means the file format or XML namespace wasn't recognized.\n\nLast output from sorter:\n${lastLines}`,
+          });
+        }
         resolve({ success: true, data, outputDir });
       } catch (parseErr) {
         resolve({

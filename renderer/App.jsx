@@ -271,7 +271,13 @@ function DropZone({ onFile, disabled }) {
     setDrag(false);
     if (disabled) return;
     const file = e.dataTransfer.files[0];
-    if (file && file.name.endsWith(".pdf")) onFile(file.path);
+    const ok = file && (
+      file.name.endsWith(".pdf") ||
+      file.name.endsWith(".pfxt") ||
+      file.name.endsWith(".pfxs") ||
+      file.name.endsWith(".pfxa")
+    );
+    if (ok) onFile(file.path);
   }, [disabled, onFile]);
 
   const handlePick = async () => {
@@ -293,12 +299,12 @@ function DropZone({ onFile, disabled }) {
       transition:"all 0.15s", opacity: disabled ? 0.5 : 1,
     }
   },
-    React.createElement("div", { style:{fontSize:36, marginBottom:10} }, "📄"),
+    React.createElement("div", { style:{fontSize:36, marginBottom:10} }, "📂"),
     React.createElement("div", { style:{fontWeight:600, fontSize:15, marginBottom:6} },
-      drag ? "Drop it!" : "Drag & drop a PDF here"
+      drag ? "Drop it!" : "Drag & drop a PDF or PFXT here"
     ),
     React.createElement("div", { style:{color:T.muted, fontSize:13} },
-      "or click to browse"
+      "or click to browse (.pdf, .pfxt, .pfxs, .pfxa)"
     )
   );
 }

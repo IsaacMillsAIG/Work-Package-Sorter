@@ -42,10 +42,13 @@ from pathlib import Path
 def progress_bar(current: int, total: int, label: str = "", width: int = 40):
     """Print progress to stderr as plain newline-terminated lines for the Electron app."""
     pct = current / total if total else 1.0
-    pct_str = f"{int(pct * 100):3d}%"
+    pct_int = int(pct * 100)
+    pct_str = f"{pct_int:3d}%"
     label_str = label[:40] if label else ""
-    # Only print every 5% or on the last item to avoid flooding the UI
-    if current == total or current == 1 or int(pct * 100) % 5 == 0:
+    # Always emit the current label (live page tracking),
+    # but only update the percentage display when it changes by at least 1%
+    prev_pct = int(((current - 1) / total if total else 1.0) * 100)
+    if current == total or current == 1 or pct_int > prev_pct:
         sys.stderr.write(f"  {pct_str}  [{current}/{total}]  {label_str}\n")
         sys.stderr.flush()
 
@@ -454,17 +457,51 @@ def parse_pfxt(pfxt_path: str) -> tuple[list[DrawingData], dict]:
     if not zipfile.is_zipfile(pfxt_path):
         raise ValueError(f"{pfxt_path} is not a valid .pfxt file (not a ZIP archive)")
 
+    # Find the main XML file — search all entries, prefer root-level but accept subdirs
     xml_content = None
+    xml_name = None
     with zipfile.ZipFile(pfxt_path, 'r') as zf:
-        for name in zf.namelist():
+        names = zf.namelist()
+        print(f"  Archive contents: {names}", file=sys.stderr, flush=True)
+        # First pass: root-level XML
+        for name in names:
             if name.endswith('.xml') and '/' not in name:
                 xml_content = zf.read(name)
+                xml_name = name
                 break
+        # Second pass: any XML anywhere in the archive
+        if xml_content is None:
+            for name in names:
+                if name.endswith('.xml'):
+                    xml_content = zf.read(name)
+                    xml_name = name
+                    break
 
     if xml_content is None:
-        raise ValueError(f"No XML file found in {pfxt_path}")
+        raise ValueError(f"No XML file found in {pfxt_path}. Archive contains: {names}")
+
+    print(f"  Parsing XML: {xml_name} ({len(xml_content)} bytes)", file=sys.stderr, flush=True)
 
     root = ET.fromstring(xml_content)
+
+    # Auto-detect namespace from the root element
+    # The tag looks like: {http://www.fabsuite.com/XML_Schemas/FabSuiteDataFile0104.xsd}FabSuiteDataExchange
+    root_tag = root.tag
+    ns_match = re.match(r'\{([^}]+)\}', root_tag)
+    detected_ns = ns_match.group(1) if ns_match else None
+    print(f"  XML root tag: {root_tag}", file=sys.stderr, flush=True)
+
+    # ── SDS2 Data Transfer — completely different schema, hand off to dedicated parser
+    if 'SDS2_Data_Transfer' in root_tag or 'SDS2' in root_tag.upper():
+        print("  Detected SDS2 format — switching to SDS2 parser", file=sys.stderr, flush=True)
+        return parse_sds2(pfxt_path)
+
+    # Build namespace dict — use detected ns, fall back to the known one
+    global PFXT_NS
+    if detected_ns:
+        PFXT_NS = {"fs": detected_ns}
+    else:
+        PFXT_NS = {"fs": "http://www.fabsuite.com/XML_Schemas/FabSuiteDataFile0104.xsd"}
 
     project_info = {}
     proj = root.find(".//fs:ProjectData/fs:ContractData/fs:ProjectId", PFXT_NS)
@@ -495,15 +532,20 @@ def parse_pfxt(pfxt_path: str) -> tuple[list[DrawingData], dict]:
 
     assemblies = root.findall(".//fs:Assembly", PFXT_NS)
     if not assemblies:
+        # Namespace didn't match — try stripping namespace entirely
         assemblies = root.findall(".//Assembly")
+    
+    print(f"  Found {len(assemblies)} assembly elements in XML", file=sys.stderr, flush=True)
 
     drawings = []
     seen_marks = set()
     for i, asm in enumerate(assemblies):
         mark = _pfxt_find_text(asm, "AssemblyMark")
-        if mark in seen_marks:
+        # Only deduplicate non-empty marks; always include assemblies with no mark parsed
+        if mark and mark in seen_marks:
             continue
-        seen_marks.add(mark)
+        if mark:
+            seen_marks.add(mark)
         d = parse_pfxt_assembly(asm, len(drawings), drawing_statuses)
         drawings.append(d)
 
@@ -512,6 +554,184 @@ def parse_pfxt(pfxt_path: str) -> tuple[list[DrawingData], dict]:
 
     return drawings, project_info
 
+
+# ─────────────────────────────────────────────────────────────
+# SDS2 DATA TRANSFER XML PARSER  (v2.0 schema, confirmed 2025-04)
+# ─────────────────────────────────────────────────────────────
+#
+# Confirmed structure (SDS2 2025.08, FileVersion 2.0):
+#
+#   <SDS2_Data_Transfer>
+#     <MetaData>
+#       <Job>, <Fabricator>, <SDS2Version>
+#     </MetaData>
+#     <DrawingSheet>   ← one per drawing
+#       <SheetType>Detail Sheet</SheetType>  ← only these are assemblies
+#       <Name>4001B</Name>
+#       <WorkType>Beam</WorkType>
+#       <DrawingData>
+#         <RevisionDescription>ISSUED FOR FABRICATION</RevisionDescription>
+#         <ApprovalStatus>Not reviewed</ApprovalStatus>
+#         ...dates...
+#       </DrawingData>
+#       (NO section, weight, or minor mark data in the XML —
+#        all of that comes from the bundled PDFs in the archive)
+#     </DrawingSheet>
+#   </SDS2_Data_Transfer>
+#
+# Strategy: read piecemark/type/status from XML, then parse each assembly's
+# PDF from Drawings/DetailSheetDrawings/<Name>.pdf using parse_drawing_page()
+# to get section size, weight, minor marks, and weld flags.
+
+
+def _sds2_text(el, tag, default=""):
+    """Return text of a direct child element, or default."""
+    child = el.find(tag)
+    return child.text.strip() if (child is not None and child.text) else default
+
+
+def _sds2_member_type(work_type: str, mark: str) -> str:
+    """Map SDS2 <WorkType> to our canonical member type string."""
+    wt = work_type.upper()
+    if "COLUMN" in wt:                                    return "COLUMN"
+    if "VERTICAL BRACE" in wt or "DIAGONAL" in wt:       return "VERTICAL BRACE"
+    if "BRACE" in wt:                                     return "VERTICAL BRACE"
+    if "BEAM" in wt or "JOIST" in wt or "PURLIN" in wt:  return "BEAM"
+    if "ANGLE" in wt:                                     return "ANGLE"
+    if "BENT" in wt:                                      return "BENT PLATE"
+    if "STAIR" in wt or "MISC" in wt:                    return "MISC"
+    # Fall back to mark prefix
+    prefix_m = re.match(r'^([A-Za-z]+)', mark)
+    prefix = prefix_m.group(1).upper() if prefix_m else ""
+    return {"B":"BEAM","C":"COLUMN","A":"ANGLE","BP":"BENT PLATE","BPL":"BENT PLATE",
+            "BR":"VERTICAL BRACE","VB":"VERTICAL BRACE","HSS":"BEAM",
+            "M":"POST","PL":"PLATE"}.get(prefix, "BEAM")
+
+
+def _sds2_fab_status(dd_el) -> str:
+    """
+    Determine fab status from <DrawingData>.
+    SDS2 v2.0 uses <RevisionDescription> — e.g. "ISSUED FOR FABRICATION", "HOLD".
+    """
+    if dd_el is None:
+        return "FOR FABRICATION"
+    rev = _sds2_text(dd_el, "RevisionDescription").upper()
+    if "HOLD" in rev or "DO NOT FAB" in rev or "VOID" in rev:
+        return "HOLD"
+    if "FABRICATION" in rev or "IFC" in rev or "FOR FAB" in rev:
+        return "FOR FABRICATION"
+    approval = _sds2_text(dd_el, "ApprovalStatus").upper()
+    if "REVISE" in approval or "REJECT" in approval:
+        return "HOLD"
+    return "FOR FABRICATION"
+
+
+def parse_sds2(pfxs_path: str) -> tuple[list[DrawingData], dict]:
+    """
+    Parse an SDS2 Data Transfer .pfxs file.
+
+    Step 1 — XML: read piecemark, WorkType, RevisionDescription per DrawingSheet.
+    Step 2 — PDF: for each Detail Sheet assembly, open its bundled PDF from
+             Drawings/DetailSheetDrawings/<Name>.pdf and run parse_drawing_page()
+             to extract section size, weight, minor marks, and weld flags.
+    """
+    with zipfile.ZipFile(pfxs_path, 'r') as zf:
+        # ── Parse XML
+        xml_name = next(
+            (n for n in zf.namelist() if n.endswith('.xml') and '/' not in n),
+            next((n for n in zf.namelist() if n.endswith('.xml')), None)
+        )
+        if not xml_name:
+            raise ValueError(f"No XML found in {pfxs_path}")
+
+        xml_content = zf.read(xml_name)
+        print(f"  Parsing SDS2 XML: {xml_name} ({len(xml_content)} bytes)", file=sys.stderr, flush=True)
+        root = ET.fromstring(xml_content)
+
+        # ── Project metadata
+        project_info = {"file_type": "sds2", "source_app": "SDS2"}
+        meta = root.find("MetaData")
+        if meta is not None:
+            project_info["project_name"] = _sds2_text(meta, "Job")
+            project_info["fabricator"]   = _sds2_text(meta, "Fabricator")
+            project_info["sds2_version"] = _sds2_text(meta, "SDS2Version")
+
+        # ── Index bundled Detail Sheet PDFs by piecemark name
+        pdf_index = {}
+        for entry in zf.namelist():
+            if entry.startswith("Drawings/DetailSheetDrawings/") and entry.endswith(".pdf"):
+                stem = entry.split("/")[-1].replace(".pdf", "")
+                pdf_index[stem] = entry
+
+        # ── Collect Detail Sheet elements from XML
+        all_sheets = root.findall("DrawingSheet")
+        detail_sheets = [s for s in all_sheets
+                         if _sds2_text(s, "SheetType") == "Detail Sheet"]
+
+        print(f"  Total DrawingSheet elements: {len(all_sheets)}", file=sys.stderr, flush=True)
+        print(f"  Detail Sheets (assemblies): {len(detail_sheets)}", file=sys.stderr, flush=True)
+        print(f"  Bundled detail PDFs: {len(pdf_index)}", file=sys.stderr, flush=True)
+
+        drawings = []
+        seen_marks = set()
+        total = len(detail_sheets)
+
+        for i, sheet in enumerate(detail_sheets):
+            name = _sds2_text(sheet, "Name")
+            if not name or name in seen_marks:
+                continue
+            seen_marks.add(name)
+
+            work_type = _sds2_text(sheet, "WorkType")
+            dd = sheet.find("DrawingData")
+
+            # Base record from XML
+            d = DrawingData(page_number=i + 1)
+            d.sheet_no    = name
+            d.ship_mark   = name
+            prefix_m = re.match(r'^([A-Za-z]+)', name)
+            d.mark_prefix  = prefix_m.group(1).upper() if prefix_m else ""
+            d.details_of   = _sds2_member_type(work_type, name)
+            d.fab_status   = _sds2_fab_status(dd)
+
+            # Enrich from bundled PDF
+            if name in pdf_index:
+                try:
+                    import io
+                    pdf_bytes = zf.read(pdf_index[name])
+                    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                        if pdf.pages:
+                            page = pdf.pages[0]
+                            text = page.extract_text() or ""
+                            pdf_d = parse_drawing_page(0, text, page=page)
+                            if pdf_d:
+                                d.main_section          = pdf_d.main_section
+                                d.section_depth         = pdf_d.section_depth
+                                d.section_weight_per_ft = pdf_d.section_weight_per_ft
+                                d.total_weight          = pdf_d.total_weight
+                                d.num_minor_marks       = pdf_d.num_minor_marks
+                                d.minor_mark_types      = pdf_d.minor_mark_types
+                                d.has_plates            = pdf_d.has_plates
+                                d.has_bent_plates       = pdf_d.has_bent_plates
+                                d.has_angles_attached   = pdf_d.has_angles_attached
+                                d.has_channels          = pdf_d.has_channels
+                                d.has_flat_bars         = pdf_d.has_flat_bars
+                                d.has_tubes_hss         = pdf_d.has_tubes_hss
+                                d.has_cjp_dcw           = pdf_d.has_cjp_dcw
+                                d.has_pjp               = pdf_d.has_pjp
+                                d.has_moment_connection = pdf_d.has_moment_connection
+                                d.galvanize             = pdf_d.galvanize
+                                d.grade                 = pdf_d.grade or d.grade
+                                # Keep XML's fab_status — more reliable than PDF for SDS2
+                except Exception as e:
+                    print(f"  Warning: could not parse PDF for {name}: {e}", file=sys.stderr, flush=True)
+
+            drawings.append(d)
+            progress_bar(i + 1, total, label=f"{name} ({work_type})")
+
+    project_info["total_assemblies"] = len(drawings)
+    print(f"  Parsed {len(drawings)} unique assemblies", file=sys.stderr, flush=True)
+    return drawings, project_info
 
 # ─────────────────────────────────────────────────────────────
 # UNIFIED FILE DETECTION
