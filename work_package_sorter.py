@@ -323,6 +323,7 @@ def _pfxt_parse_section(shape: str, dimensions: str) -> str:
     return f"{shape}{dim_clean}"
 
 
+
 def _pfxt_infer_member_type(mark: str, main_shape: str, main_category: str) -> str:
     """Infer the member type (BEAM, COLUMN, etc.) from PFXT data."""
     prefix = re.match(r'^([A-Z]+)', mark)
@@ -452,107 +453,135 @@ def parse_pfxt(pfxt_path: str) -> tuple[list[DrawingData], dict]:
     Parse a .pfxt file (Tekla PowerFab eXchange format).
 
     PFXT is a ZIP archive containing an XML file with full BOM/assembly data.
+    Weight is not present in the XML — it is read from the bundled detail
+    sheet PDFs in Drawings/DetailSheetDrawings/<mark>.pdf using the same
+    PDF weight-extraction logic used for standalone PDF input.
+
     Returns: (list of DrawingData, project metadata dict)
     """
     if not zipfile.is_zipfile(pfxt_path):
         raise ValueError(f"{pfxt_path} is not a valid .pfxt file (not a ZIP archive)")
 
-    # Find the main XML file — search all entries, prefer root-level but accept subdirs
-    xml_content = None
-    xml_name = None
     with zipfile.ZipFile(pfxt_path, 'r') as zf:
         names = zf.namelist()
-        print(f"  Archive contents: {names}", file=sys.stderr, flush=True)
-        # First pass: root-level XML
+
+        # ── Find and read the XML
+        xml_name = None
         for name in names:
             if name.endswith('.xml') and '/' not in name:
-                xml_content = zf.read(name)
                 xml_name = name
                 break
-        # Second pass: any XML anywhere in the archive
-        if xml_content is None:
+        if xml_name is None:
             for name in names:
                 if name.endswith('.xml'):
-                    xml_content = zf.read(name)
                     xml_name = name
                     break
+        if xml_name is None:
+            raise ValueError(f"No XML file found in {pfxt_path}")
 
-    if xml_content is None:
-        raise ValueError(f"No XML file found in {pfxt_path}. Archive contains: {names}")
+        xml_content = zf.read(xml_name)
+        print(f"  Parsing XML: {xml_name} ({len(xml_content)} bytes)", file=sys.stderr, flush=True)
 
-    print(f"  Parsing XML: {xml_name} ({len(xml_content)} bytes)", file=sys.stderr, flush=True)
+        root = ET.fromstring(xml_content)
+        root_tag = root.tag
+        ns_match = re.match(r'\{([^}]+)\}', root_tag)
+        detected_ns = ns_match.group(1) if ns_match else None
+        print(f"  XML root tag: {root_tag}", file=sys.stderr, flush=True)
 
-    root = ET.fromstring(xml_content)
+        # ── SDS2 format — hand off
+        if 'SDS2_Data_Transfer' in root_tag or 'SDS2' in root_tag.upper():
+            print("  Detected SDS2 format — switching to SDS2 parser", file=sys.stderr, flush=True)
+            return parse_sds2(pfxt_path)
 
-    # Auto-detect namespace from the root element
-    # The tag looks like: {http://www.fabsuite.com/XML_Schemas/FabSuiteDataFile0104.xsd}FabSuiteDataExchange
-    root_tag = root.tag
-    ns_match = re.match(r'\{([^}]+)\}', root_tag)
-    detected_ns = ns_match.group(1) if ns_match else None
-    print(f"  XML root tag: {root_tag}", file=sys.stderr, flush=True)
+        # ── Namespace
+        global PFXT_NS
+        PFXT_NS = {"fs": detected_ns} if detected_ns else \
+                  {"fs": "http://www.fabsuite.com/XML_Schemas/FabSuiteDataFile0104.xsd"}
 
-    # ── SDS2 Data Transfer — completely different schema, hand off to dedicated parser
-    if 'SDS2_Data_Transfer' in root_tag or 'SDS2' in root_tag.upper():
-        print("  Detected SDS2 format — switching to SDS2 parser", file=sys.stderr, flush=True)
-        return parse_sds2(pfxt_path)
+        # ── Project metadata
+        project_info = {}
+        proj = root.find(".//fs:ProjectData/fs:ContractData/fs:ProjectId", PFXT_NS)
+        if proj is not None:
+            project_info["project_number"] = _pfxt_find_text(proj, "ProjectNumber")
+            project_info["project_name"]   = _pfxt_find_text(proj, "ProjectName")
+        source = root.find(".//fs:FileSourceData", PFXT_NS)
+        if source is not None:
+            project_info["source_app"]     = _pfxt_find_text(source, "SourceApplication")
+            project_info["source_version"] = _pfxt_find_text(source, "SourceApplicationVersion")
+            project_info["export_date"]    = _pfxt_find_text(source, "FileCreationDate")
+            company = source.find("fs:CompanyData", PFXT_NS)
+            if company is not None:
+                project_info["company"] = _pfxt_find_text(company, "CompanyName")
 
-    # Build namespace dict — use detected ns, fall back to the known one
-    global PFXT_NS
-    if detected_ns:
-        PFXT_NS = {"fs": detected_ns}
-    else:
-        PFXT_NS = {"fs": "http://www.fabsuite.com/XML_Schemas/FabSuiteDataFile0104.xsd"}
+        # ── Drawing statuses
+        drawing_statuses = {}
+        for md in root.findall(".//fs:MultiDrawing", PFXT_NS):
+            dnum = _pfxt_find_text(md, "DrawingNumber")
+            rev  = _pfxt_find_text(md, "DrawingRevision/RevisionDescription")
+            if dnum and rev:
+                drawing_statuses[dnum] = rev
+        for sd in root.findall(".//fs:SingleDrawing", PFXT_NS):
+            dnum = _pfxt_find_text(sd, "DrawingNumber")
+            rev  = _pfxt_find_text(sd, "DrawingRevision/RevisionDescription")
+            if dnum and rev:
+                drawing_statuses[dnum] = rev
 
-    project_info = {}
-    proj = root.find(".//fs:ProjectData/fs:ContractData/fs:ProjectId", PFXT_NS)
-    if proj is not None:
-        project_info["project_number"] = _pfxt_find_text(proj, "ProjectNumber")
-        project_info["project_name"] = _pfxt_find_text(proj, "ProjectName")
+        # ── Assembly elements
+        assemblies = root.findall(".//fs:Assembly", PFXT_NS) or \
+                     root.findall(".//Assembly")
+        print(f"  Found {len(assemblies)} assembly elements in XML", file=sys.stderr, flush=True)
 
-    source = root.find(".//fs:FileSourceData", PFXT_NS)
-    if source is not None:
-        project_info["source_app"] = _pfxt_find_text(source, "SourceApplication")
-        project_info["source_version"] = _pfxt_find_text(source, "SourceApplicationVersion")
-        project_info["export_date"] = _pfxt_find_text(source, "FileCreationDate")
-        company = source.find("fs:CompanyData", PFXT_NS)
-        if company is not None:
-            project_info["company"] = _pfxt_find_text(company, "CompanyName")
+        # ── Index bundled detail PDFs by piecemark
+        # PFXT archives store drawings in Drawings/MultiDrawings/<mark>.pdf
+        # Fall back to DetailSheetDrawings for older exports
+        pdf_index = {}
+        for entry in names:
+            if not entry.endswith(".pdf"):
+                continue
+            stem = entry.split("/")[-1].replace(".pdf", "")
+            if "MultiDrawings" in entry:
+                pdf_index[stem] = entry          # preferred — overwrites any prior match
+            elif stem not in pdf_index:
+                pdf_index[stem] = entry          # fallback
+        print(f"  Bundled detail PDFs: {len(pdf_index)}", file=sys.stderr, flush=True)
 
-    drawing_statuses = {}
-    for md in root.findall(".//fs:MultiDrawing", PFXT_NS):
-        dnum = _pfxt_find_text(md, "DrawingNumber")
-        rev_desc = _pfxt_find_text(md, "DrawingRevision/RevisionDescription")
-        if dnum and rev_desc:
-            drawing_statuses[dnum] = rev_desc
-    for sd in root.findall(".//fs:SingleDrawing", PFXT_NS):
-        dnum = _pfxt_find_text(sd, "DrawingNumber")
-        rev_desc = _pfxt_find_text(sd, "DrawingRevision/RevisionDescription")
-        if dnum and rev_desc:
-            drawing_statuses[dnum] = rev_desc
+        # ── Parse assemblies, look up weight from bundled PDF
+        drawings = []
+        seen_marks = set()
+        total = len(assemblies)
 
-    assemblies = root.findall(".//fs:Assembly", PFXT_NS)
-    if not assemblies:
-        # Namespace didn't match — try stripping namespace entirely
-        assemblies = root.findall(".//Assembly")
-    
-    print(f"  Found {len(assemblies)} assembly elements in XML", file=sys.stderr, flush=True)
+        for i, asm in enumerate(assemblies):
+            mark = _pfxt_find_text(asm, "AssemblyMark")
+            if mark and mark in seen_marks:
+                continue
+            if mark:
+                seen_marks.add(mark)
 
-    drawings = []
-    seen_marks = set()
-    for i, asm in enumerate(assemblies):
-        mark = _pfxt_find_text(asm, "AssemblyMark")
-        # Only deduplicate non-empty marks; always include assemblies with no mark parsed
-        if mark and mark in seen_marks:
-            continue
-        if mark:
-            seen_marks.add(mark)
-        d = parse_pfxt_assembly(asm, len(drawings), drawing_statuses)
-        drawings.append(d)
+            d = parse_pfxt_assembly(asm, len(drawings), drawing_statuses)
+
+            # Weight is not in PFXT XML — extract from bundled detail sheet PDF
+            if mark and mark in pdf_index:
+                try:
+                    import io
+                    pdf_bytes = zf.read(pdf_index[mark])
+                    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                        if pdf.pages:
+                            text = pdf.pages[0].extract_text() or ""
+                            pdf_d = parse_drawing_page(0, text, page=pdf.pages[0])
+                            if pdf_d and pdf_d.total_weight:
+                                d.total_weight = pdf_d.total_weight
+                except Exception as e:
+                    print(f"  Warning: PDF weight lookup failed for {mark}: {e}",
+                          file=sys.stderr, flush=True)
+
+            drawings.append(d)
+            progress_bar(i + 1, total, label=f"{mark}")
 
     project_info["total_assemblies"] = len(drawings)
     project_info["file_type"] = "pfxt"
-
+    print(f"  Found {len(drawings)} assemblies", file=sys.stderr, flush=True)
     return drawings, project_info
+
 
 
 # ─────────────────────────────────────────────────────────────

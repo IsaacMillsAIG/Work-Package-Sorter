@@ -323,7 +323,7 @@ function DrawingTable({ drawings, filter }) {
 
   return React.createElement("div", {
     style:{ overflowX:"auto", border:`1px solid ${T.border}`, borderRadius:8,
-      maxHeight:440, overflowY:"auto" }
+      flex:1, overflowY:"auto", minHeight:0 }
   },
     React.createElement("table", { style:{width:"100%", borderCollapse:"collapse", fontSize:12} },
       React.createElement("thead", null,
@@ -804,7 +804,7 @@ function App() {
     ),
 
     // ── Scrollable body ──────────────────────────────────────────────────
-    React.createElement("div", { style:{flex:1, overflowY:"auto", padding:"24px 28px"} },
+    React.createElement("div", { style:{flex:1, overflowY: activeTab==="table" && hasData ? "hidden" : "auto", padding:"24px 28px", display:"flex", flexDirection:"column"} },
 
       // ── Error ────────────────────────────────────────────────────────
       React.createElement(ErrorBanner, { message:error, onDismiss:()=>setError("") }),
@@ -931,7 +931,7 @@ function App() {
       ),
 
       // ── Has data: show results ───────────────────────────────────────
-      hasData && React.createElement(React.Fragment, null,
+      hasData && React.createElement("div", { style:{display:"flex",flexDirection:"column",flex:1,minHeight:0} },
 
         // Tabs
         React.createElement("div", {
@@ -1047,8 +1047,8 @@ function App() {
         ),
 
         // ── Drawing list tab ─────────────────────────────────────────
-        activeTab==="table" && React.createElement(React.Fragment, null,
-          React.createElement("div", { style:{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"} },
+        activeTab==="table" && React.createElement("div", { style:{display:"flex",flexDirection:"column",flex:1,minHeight:0} },
+          React.createElement("div", { style:{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap",flexShrink:0} },
             React.createElement("button", {
               onClick:()=>setTableFilter("ALL"),
               style:{ padding:"6px 14px",borderRadius:6,
@@ -1087,7 +1087,7 @@ function App() {
           ? React.createElement("span", { style:{fontFamily:"monospace"} }, pdfPath)
           : "No file loaded"
       ),
-      React.createElement("span", null, "Work Package Sorter v1.1")
+      React.createElement("span", null, "Work Package Sorter v1.2")
     )
   );
 }
